@@ -35,7 +35,8 @@ URG = 0x20
 ECE = 0x40
 CWR = 0x80
 
-def gse_parse(file, outfile, matype_crib=int(0x4200), stream=False, tcp_hijack=False, tcp_hijack_ips=None):
+def gse_parse(file, outfile, matype_crib=int(0x4200), stream=False, tcp_hijack=False, tcp_hijack_ips=None, reliable=True):
+    print("reliability set to ", reliable)
     with open(outfile, 'wb') as pcap_file:
         io = KaitaiStream(open(file, 'rb'))
         pcap_writer = Writer()
@@ -73,13 +74,18 @@ def gse_parse(file, outfile, matype_crib=int(0x4200), stream=False, tcp_hijack=F
                 print("BBFrame", bbframe_count, " contains corrupt data, (MA2:", current_bbframe.bbheader.matype_2, ") attempting to recover")
             else:
                 gse_packets = get_gse_from_bbdata(current_bbframe.data_field)
-                raw_packets = parse_gse_packet_array(gse_packets, bbframe_count)
+                raw_packets = parse_gse_packet_array(gse_packets, bbframe_count, reliable=reliable)
                 if len(raw_packets) > 0:
                     pcap_writer.write(raw_packets, pcap_file)
                     pkt_count += len(raw_packets)
                     if pkt_count % 10000 == 0:
                         print(pkt_count, "packets parsed")
                         print(counters)
+        print("Cleaning up lingering fragments")
+        raw_packets = parse_gse_packet_array([],0, cleanup=True,reliable=reliable)
+        if len(raw_packets) > 0:
+            print(len(raw_packets), "fragments found.")
+            pcap_writer.write(raw_packets, pcap_file)
         print(counters)
 
 def get_gse_from_bbdata(bbdata):
@@ -95,7 +101,7 @@ def get_gse_from_bbdata(bbdata):
             counters['truncated_gse_packets'] += 1
     return gse_packets
 
-def parse_gse_packet_array(gse_packets, frame_number):
+def parse_gse_packet_array(gse_packets, frame_number, cleanup=False, reliable=True):
     scapy_packets = []
     for gse in gse_packets:
         s_packets = None
@@ -109,7 +115,7 @@ def parse_gse_packet_array(gse_packets, frame_number):
         elif gse.gse_header.start_indicator and gse.gse_header.end_indicator:
             # complete gse packet
             counters['gse_full_packets'] += 1
-            s_packets = extract_ip_from_gse_data(gse.gse_payload.data)
+            s_packets = extract_ip_from_gse_data(gse.gse_payload.data, high_reliability=reliable)
         else:
             frag_id = str(gse.gse_header.frag_id)
             if gse.gse_header.start_indicator and not gse.gse_header.end_indicator:
@@ -118,7 +124,7 @@ def parse_gse_packet_array(gse_packets, frame_number):
                 if frag_id in defrag_dict:
                     # if this interrupts an already started fragment
                     # parse the existing (partial) fragment to the best of our ability before overwriting
-                    s_packets = extract_ip_from_gse_data(defrag_dict[frag_id][1])
+                    s_packets = extract_ip_from_gse_data(defrag_dict[frag_id][1], high_reliability=reliable)
                     counters['salvage_gse_packets'] += 1
 
                 # we add a tuple with the index of the new fragment to the defragment dictionary
@@ -129,7 +135,7 @@ def parse_gse_packet_array(gse_packets, frame_number):
                 if frame_number - defrag_dict[frag_id][0] > 256:
                     # if the frame number where we caught this is more than 256 frames from the start packet it cannot be a valid fragment
                     # we'll make a best effort to recover the existing partial fragment with dummy data
-                    s_packets = extract_ip_from_gse_data(defrag_dict[frag_id][1])
+                    s_packets = extract_ip_from_gse_data(defrag_dict[frag_id][1], high_reliability=reliable)
                     counters['salvage_gse_packets'] += 1
 
                     # then we'll delete the expired data from the fragment dictionary
@@ -140,16 +146,24 @@ def parse_gse_packet_array(gse_packets, frame_number):
 
                     # if this is the end of a fragment, we can go ahead and attempt to parse out packets and then clear the dictionary
                     if gse.gse_header.end_indicator:
-                        extracted_ip_packets = extract_ip_from_gse_data(defrag_dict[frag_id][1])
+                        extracted_ip_packets = extract_ip_from_gse_data(defrag_dict[frag_id][1], high_reliability=reliable)
                         if extracted_ip_packets is not None:
-                            scapy_packets.append(extract_ip_from_gse_data(defrag_dict[frag_id][1]))
+                            scapy_packets.append(extract_ip_from_gse_data(defrag_dict[frag_id][1]), high_reliability=reliable)
                         counters['defragmented_gse_packets'] += 1
                         defrag_dict.pop(frag_id, None)
         if s_packets is not None:
             scapy_packets.append(s_packets)
+    if cleanup:
+        print("cleaning up")
+        for _, entry in defrag_dict.values():
+            extracted_ip_packets = extract_ip_from_gse_data(entry[1], high_reliability=reliable)
+            if extracted_ip_packets is not None:
+                print("recovery")
+                scapy_packets.append(extracted_ip_packets)
+            counters['salvage_gse_packets'] += 1
     return scapy_packets
 
-def extract_ip_from_gse_data(raw_data, high_reliability=False, tcp_hijack=False, tcp_hijack_ips=[None, None]):
+def extract_ip_from_gse_data(raw_data, high_reliability=True, tcp_hijack=False, tcp_hijack_ips=[None, None]):
     ip_packet = None
     simple_packet = None
     try:
@@ -163,6 +177,18 @@ def extract_ip_from_gse_data(raw_data, high_reliability=False, tcp_hijack=False,
         except:
             counters['non_ip_or_corrupt_gse'] += 1
     except ValueError:
+        # we can try and force a typical first two bytes of an IPV4 header to bully GSExtract into making a packet
+        # this runs the risk of invalid IP headers but catches some packets when there are undocument proprietary GSE extensions
+        if not high_reliability:
+            try:
+                raw_data = b"\x45" + raw_data  + (3 * len(raw_data)) * b"\x00"
+                ip_packet = Ipv4Packet.from_bytes(raw_data)
+            except:
+                try:
+                    raw_data = b"\x45\x00" + raw_data[1:] + (3 * len(raw_data)) * b"\x00"
+                    ip_packet = Ipv4Packet.from_bytes(raw_data)
+                except:
+                    pass
         counters['non_ip_or_corrupt_gse'] += 1
     except:
         pass
