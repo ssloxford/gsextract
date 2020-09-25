@@ -36,7 +36,6 @@ ECE = 0x40
 CWR = 0x80
 
 def gse_parse(file, outfile, matype_crib=int(0x4200), stream=False, tcp_hijack=False, tcp_hijack_ips=None, reliable=True):
-    print("reliability set to ", reliable)
     with open(outfile, 'wb') as pcap_file:
         io = KaitaiStream(open(file, 'rb'))
         pcap_writer = Writer()
@@ -46,49 +45,68 @@ def gse_parse(file, outfile, matype_crib=int(0x4200), stream=False, tcp_hijack=F
         eof_count = 0
         while True:
             try:
+                # we record the last io position for kaitai so we can recover from EOF errors in streaming mode
                 last_pos = io.pos()
+                # prints the first BBframe we find at the current IO position
+                # this throws EOF if there's no bytes left in the file
                 current_bbframe = PureBb(io, matype_crib=matype_crib).bbframe
-                if eof_count >0:
+                if eof_count > 0:
                     print("new frames found, continuing...")
                     eof_count = 0
             except EOFError:
                 if not stream:
+                    # if we're reading from a static file EOFError is sufficient reason to stop
                     break
                 elif eof_count == 0:
                     pass
+                # otherwise we will wait progressively longer whenever there isn't data in the streamed file
                 elif eof_count % 10000 == 0:
                     time.sleep(1)
                 elif eof_count > 1000000:
                     time.sleep(10)
                 elif eof_count > 1000600:
+                    # after an hour of no fresh bytes (plus a little bit more), gsextract will exit and clean up buffers
+                    # this normally means something has broken in the satellite hardware side
                     print("No new data received for at least 1 hour. Exiting gsextract.")
                 eof_count += 1
                 io.seek(last_pos)
                 continue
             except:
+                # we want to maximize recovery in the case of stream parsing errors so we will just keep trying
                 continue
 
             bbframe_count += 1
+            # record stats on corrupt BBframes and then move to the next frame
             if hasattr(current_bbframe, 'corrupt_data'):
                 counters['broken_bbframes'] += 1
                 print("BBFrame", bbframe_count, " contains corrupt data, (MA2:", current_bbframe.bbheader.matype_2, ") attempting to recover")
             else:
+                # for valid BBFrames
+                # next extract gse packets from the bbframe and try to make them into IP payloads
                 gse_packets = get_gse_from_bbdata(current_bbframe.data_field)
                 raw_packets = parse_gse_packet_array(gse_packets, bbframe_count, reliable=reliable)
+
+                # if we get any IP packets, write them to a pcap file
                 if len(raw_packets) > 0:
                     pcap_writer.write(raw_packets, pcap_file)
                     pkt_count += len(raw_packets)
+
+                    # print some  progress stats
                     if pkt_count % 10000 == 0:
                         print(pkt_count, "packets parsed")
                         print(counters)
-        print("Cleaning up lingering fragments")
+
+        # Clean up any lingering fragments when GSExtract closes
+        # these would be partially filled buffers from end of recording
         raw_packets = parse_gse_packet_array([],0, cleanup=True,reliable=reliable)
         if len(raw_packets) > 0:
-            print(len(raw_packets), "fragments found.")
             pcap_writer.write(raw_packets, pcap_file)
+
+        # Print some basic stats before finishing
         print(counters)
 
 def get_gse_from_bbdata(bbdata):
+    # Loop through the Bytes a bbframe payload and attempt to parse them as GSEpackets
     io = KaitaiStream(BytesIO(bbdata))
     gse_packets = []
     while not io.is_eof():
@@ -103,6 +121,7 @@ def get_gse_from_bbdata(bbdata):
 
 def parse_gse_packet_array(gse_packets, frame_number, cleanup=False, reliable=True):
     scapy_packets = []
+    # Loop through the GSE packets and assemble fragments into their buffers
     for gse in gse_packets:
         s_packets = None
         if gse.gse_header.end_indicator and not gse.gse_header.start_indicator:
@@ -152,13 +171,13 @@ def parse_gse_packet_array(gse_packets, frame_number, cleanup=False, reliable=Tr
                         counters['defragmented_gse_packets'] += 1
                         defrag_dict.pop(frag_id, None)
         if s_packets is not None:
+            # build an array of packets we've extracted so far
             scapy_packets.append(s_packets)
     if cleanup:
-        print("cleaning up")
+        # in cleanup mode, we parse through anything left over in the buffer
         for _, entry in defrag_dict.values():
             extracted_ip_packets = extract_ip_from_gse_data(entry[1], high_reliability=reliable)
             if extracted_ip_packets is not None:
-                print("recovery")
                 scapy_packets.append(extracted_ip_packets)
             counters['salvage_gse_packets'] += 1
     return scapy_packets
